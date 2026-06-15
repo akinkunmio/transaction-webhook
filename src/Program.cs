@@ -4,11 +4,24 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Dapper;
+using Microsoft.Data.Sqlite;
 using Npgsql;
 using src;
 
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
+
+var useInMemoryDatabase = app.Environment.IsDevelopment() || app.Configuration.GetValue<bool>("UseInMemoryDatabase");
+const string sqliteMemoryConnectionString = "Data Source=file:transactions?mode=memory&cache=shared";
+SqliteConnection? sqliteKeepAliveConnection = null;
+
+if (useInMemoryDatabase)
+{
+    sqliteKeepAliveConnection = new SqliteConnection(sqliteMemoryConnectionString);
+    await sqliteKeepAliveConnection.OpenAsync();
+    await TransactionRepository.EnsureSchemaAsync(sqliteKeepAliveConnection);
+    app.Lifetime.ApplicationStopping.Register(() => sqliteKeepAliveConnection.Dispose());
+}
 
 app.MapGet("/health", () => Results.Ok(new { status = "Healthy" }))
     .WithName("HealthCheck")
@@ -76,16 +89,31 @@ app.MapPost("/webhooks/transactions", async (HttpContext context, IConfiguration
     if (request.OccurredAt > DateTime.UtcNow.AddMinutes(5))
         return Results.BadRequest(new { error = "occurred_at cannot be in the future" });
 
+    var useInMemoryDatabase = app.Environment.IsDevelopment() || config.GetValue<bool>("UseInMemoryDatabase");
+    
+    if (useInMemoryDatabase)
+    {
+        await using var sqliteConnection = new SqliteConnection(sqliteMemoryConnectionString);
+        await sqliteConnection.OpenAsync();
+
+        var sqliteUpsertResult = await TransactionRepository.UpsertAsync(sqliteConnection, request);
+        
+        logger.LogInformation("Processed transaction {TransactionId} highValue={HighValue} inserted={Inserted} [SQLite in-memory]", request.TransactionId, sqliteUpsertResult.Record.HighValue, sqliteUpsertResult.Inserted);
+
+        return sqliteUpsertResult.Inserted
+            ? Results.Created($"/webhooks/transactions/{sqliteUpsertResult.Record.TransactionId}", sqliteUpsertResult.Record)
+            : Results.Ok(sqliteUpsertResult.Record);
+    }
+
     var defaultPostgres = config.GetConnectionString("Postgres")
         ?? "Host=localhost;Port=5432;Database=transactions;Username=postgres;Password=postgres";
 
-    var connectionString = config.GetValue<string>("POSTGRES_CONNECTION")
-        ?? defaultPostgres;
+    var connectionString = defaultPostgres;
 
-    await using var connection = new NpgsqlConnection(connectionString);
-    await connection.OpenAsync();
+    await using var postgresConnection = new NpgsqlConnection(connectionString);
+    await postgresConnection.OpenAsync();
 
-    var upsertResult = await TransactionRepository.UpsertAsync(connection, request);
+    var postgresUpsertResult = await TransactionRepository.UpsertAsync(postgresConnection, request);
 
     logger.LogInformation("Processed transaction {TransactionId} highValue={HighValue} inserted={Inserted}", request.TransactionId, upsertResult.Record.HighValue, upsertResult.Inserted);
 
